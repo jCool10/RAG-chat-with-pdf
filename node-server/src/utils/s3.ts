@@ -1,5 +1,4 @@
 import fs from 'fs'
-import { tmpdir } from 'os'
 import path from 'path'
 import { Readable } from 'stream'
 import { configs } from '@/configs'
@@ -20,7 +19,14 @@ export const downloadFile = async ({ key }: { key: string }) => {
     throw new NotFoundError('File not found')
   }
 
-  const directoryPath = path.join(tmpdir(), key)
+  // The key embeds a client filename; refuse anything that would resolve outside the download directory
+  const baseDir = path.resolve(configs.upload.tmpDir)
+  const directoryPath = path.resolve(baseDir, key)
+
+  if (!directoryPath.startsWith(baseDir + path.sep)) {
+    throw new BadRequestError('Invalid file key')
+  }
+
   await fs.promises.mkdir(path.dirname(directoryPath), { recursive: true })
 
   const fileStream = fs.createWriteStream(directoryPath)
@@ -32,7 +38,6 @@ export const downloadFile = async ({ key }: { key: string }) => {
         reject(new BadRequestError('Failed to download the file.'))
       })
       .on('finish', () => {
-        console.log(`File has been saved to ${directoryPath}`)
         resolve(directoryPath)
       })
   })

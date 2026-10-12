@@ -1,595 +1,138 @@
 # System Architecture
 
-## High-Level Component Diagram
+Why the system is shaped this way: [project-overview-pdr.md](project-overview-pdr.md#key-decisions). Known defects in these flows: [project-roadmap.md](project-roadmap.md).
+
+## Components and trust boundaries
 
 ```mermaid
 graph TB
-    subgraph Client["Frontend Layer"]
-        UI["Next.js App<br/>(React 18 + Tailwind)"]
-        Store["React Query<br/>(State Management)"]
+    subgraph Public
+        Browser["Browser"] --> Client["client (Next.js, :3000)"]
+        Client -->|"REST + auth headers"| Node["node-server (Express, :8000 default)"]
     end
-
-    subgraph API["API Gateway"]
-        Auth["Auth Service<br/>(JWT RS256)"]
-        Files["Files Service<br/>(Upload, Query)"]
-        Enc["Encryption Service<br/>(RSA per-user)"]
+    subgraph Internal["Internal only (no auth)"]
+        Py["python-server (FastAPI, :8080)"]
+        Milvus[("Milvus standalone<br/>+ etcd + MinIO")]
+        BM25[("BM25 pickles<br/>python-server/data/bm25_indices/")]
     end
-
-    subgraph Data["Data Layer"]
-        DB["MongoDB<br/>(Users, Workspaces, Messages)"]
-        S3["AWS S3<br/>(PDFs)"]
+    subgraph External
+        Mongo[("MongoDB")]
+        S3[("AWS S3 bucket")]
+        LLM["vLLM server on GCP<br/>OpenAI-compatible API"]
     end
-
-    subgraph RAG["RAG Service"]
-        Loader["File Loader<br/>(PDF, DOCX, TXT)"]
-        Split["Text Splitter<br/>(512 tok, 128 ov)"]
-        Embed["Embedding Model<br/>(BAAI/bge-m3)"]
-        Hybrid["Hybrid Search<br/>(Milvus + BM25)"]
-        Rerank["Re-ranker<br/>(cross-encoder)"]
-        LLM["LLM Chain<br/>(Remote HTTP)"]
-    end
-
-    subgraph Storage["Vector Storage"]
-        Milvus["Milvus<br/>(Vector DB)"]
-        BM25["BM25 Index<br/>(Persisted)"]
-    end
-
-    UI --> Store
-    Store --> Auth
-    Store --> Files
-    Files --> Enc
-    
-    Auth --> DB
-    Files --> DB
-    Files --> S3
-    Files --> Loader
-    
-    Loader --> Split
-    Split --> Embed
-    Embed --> Milvus
-    Embed --> BM25
-    
-    Files --> Hybrid
-    Hybrid --> Milvus
-    Hybrid --> BM25
-    Hybrid --> Rerank
-    Rerank --> LLM
-    LLM -.->|HTTP| ExtLLM["External LLM<br/>(Llama 3.2 3B)"]
+    Node --> Mongo
+    Node --> S3
+    Node -->|"POST /embed, /query"| Py
+    Py --> Milvus
+    Py --> BM25
+    Py -->|"POST /v1/chat/completions"| LLM
 ```
 
----
+- **node-server** is the only component that authenticates callers and checks workspace ownership. Anything that reaches python-server is trusted, so Compose binds it to localhost only.
+- **python-server** reads files from paths that node-server gives it. The two must share a directory (`UPLOAD_TMP_DIR`); see [Embed flow](#embed-flow).
+- **MongoDB** holds users, keys, workspaces and chat history. **S3** holds the original uploads. **Milvus + BM25 files** hold the derived search indexes and can be rebuilt from the originals.
 
-## Query Execution Flow
+## Embed flow
+
+A workspace is created and indexed in one synchronous HTTP request.
 
 ```mermaid
 sequenceDiagram
-    participant User
-    participant Frontend
-    participant NodeAPI
-    participant PyRAG
-    participant Milvus
-    participant BM25
-    participant Reranker
-    participant ExtLLM
-
-    User->>Frontend: Type query
-    Frontend->>NodeAPI: POST /api/files/workspace/slug/query<br/>{query, history}
-    
-    NodeAPI->>NodeAPI: Validate auth + workspace
-    NodeAPI->>NodeAPI: Create Message record
-    
-    NodeAPI->>PyRAG: POST /query<br/>{query, collection, history}
-    
-    PyRAG->>PyRAG: Embed query (BAAI/bge-m3)
-    
-    par Dense Search
-        PyRAG->>Milvus: Search k=20
-        Milvus-->>PyRAG: Dense results
-    and Sparse Search
-        PyRAG->>BM25: Search k=20
-        BM25-->>PyRAG: Sparse results
-    end
-    
-    PyRAG->>PyRAG: Fuse (RRF or linear)
-    PyRAG->>Reranker: Score top candidates
-    Reranker-->>PyRAG: Ranked top-5
-    
-    PyRAG->>PyRAG: Build prompt with chunks + history
-    PyRAG->>ExtLLM: POST /v1/chat/completions
-    ExtLLM-->>PyRAG: Response text
-    
-    PyRAG-->>NodeAPI: {docs, response, stats}
-    
-    NodeAPI->>NodeAPI: Encrypt response (RSA)
-    NodeAPI->>NodeAPI: Store Message + sources
-    NodeAPI-->>Frontend: Response + metadata
-    
-    Frontend->>Frontend: Decrypt + render
-    Frontend-->>User: Display chat + sources
+    participant C as client
+    participant N as node-server
+    participant S as S3
+    participant P as python-server
+    participant M as Milvus
+    C->>N: POST /api/files/embed (multipart: files[≤10, ≤50 MB, pdf/docx/txt], workspaceName)
+    N->>S: multer-s3 upload, key = timestamp-basename(originalname)
+    N->>S: download each object to UPLOAD_TMP_DIR (default: OS tmpdir)
+    N->>N: create Workspace (random slug, file paths and keys)
+    N->>P: POST /embed {file_paths, collection_name: slug}
+    P->>P: load PDF/DOCX/TXT, split (512 chars, 128 overlap)
+    P->>M: bge-m3 vectors into collection "slug"
+    P->>P: build BM25 index, pickle to data/bm25_indices/slug.pkl
+    P-->>N: success (failure if no file could be loaded)
+    N->>N: workspace.isEmbedded = true
+    N-->>C: {slug}
 ```
 
----
+Owners: `node-server/src/services/files.service.ts` (`embedFiles`), `python-server/app/services/rag_service.py` (`embed_documents`).
 
-## Embedding & File Processing Pipeline
+## Query flow
+
+```mermaid
+sequenceDiagram
+    participant C as client
+    participant N as node-server
+    participant P as python-server
+    participant L as vLLM
+    C->>N: POST /api/files/workspace/:slug/query {question}
+    N->>N: check the caller owns the workspace (else 404)
+    N->>N: take the last 3 Q&A pairs of the chat history
+    N->>P: POST /query {query, collection_name: slug, history}
+    P->>P: dense top-20 (Milvus, COSINE) + BM25 top-20
+    P->>P: Reciprocal Rank Fusion (k=60), keep top-5
+    P->>L: Vietnamese prompt with the 5 chunks and the history
+    L-->>P: answer
+    P-->>N: {docs, response, search_stats}
+    N->>N: append question, answer, sourceDocs to the workspace's Message document
+    N-->>C: {type: "apiMessage", message, sourceDocs}
+```
+
+Retrieval parameters are read from `python-server/config.yaml` (`document_processing`, `hybrid_search`, `bm25_index_dir`). Several other keys in that file are not read by the code; grep `app/` for a key before trusting it. The cross-encoder reranker exists in `app/core/vector_stores/milvus.py` but runs only on the non-hybrid path.
+
+Owners: `files.service.ts` (`queryWorkspace`), `rag_service.py` (`query_documents`), `app/core/retrievers/hybrid_searcher.py`, `app/core/fusion/score_fusion.py`.
+
+## Authentication
+
+```mermaid
+sequenceDiagram
+    participant C as client
+    participant N as node-server
+    participant DB as MongoDB
+    C->>N: POST /api/auth/login {email, password}
+    N->>DB: verify bcrypt hash; load UserKeyPair (create if missing)
+    N->>N: decrypt private key with MASTER_ENCRYPTION_KEY
+    N->>N: sign access + refresh JWT (RS256, payload {user: {_id, email, name}}) with the user's private key
+    N->>DB: upsert Keystore {client: userId, publicKey}
+    N-->>C: {tokens, keyId, publicKey, user}
+    C->>N: any request with headers authorization, client-id
+    N->>DB: Keystore by client-id
+    N->>N: verify the access token (RS256 only) with the keystore's public key
+    C->>N: on 401 "jwt expired": POST /api/auth/refresh-token with headers refresh-token, client-id
+    N->>N: verify the refresh token; reject (and delete the Keystore) if it was already used
+    N-->>C: new token pair
+```
+
+- Headers are `authorization` (the raw access token, with no `Bearer` prefix), `refresh-token` and `client-id` (the user's `_id`). They are set by the Axios interceptor in `client/utils/axios.ts`. Only the refresh endpoint accepts the refresh token; every other route requires the access token.
+- Auth failures return 401. The message `jwt expired` makes the client refresh; any other message (`Unauthorized`) makes it log out.
+- There is one Keystore record per user. Logout, or reuse of a spent refresh token, deletes it, which invalidates every token the user holds.
+- Login and register are rate-limited (`node-server/src/middlewares/rate-limit.middleware.ts`).
+- `MASTER_ENCRYPTION_KEY` must stay constant across restarts. Without it, the server generates a random key per process, and every stored private key becomes unreadable. Login then fails for all existing users.
+- `POST /api/auth/encrypt` and `/decrypt` are general-purpose utilities. Chat messages are stored in plaintext.
+
+Owners: `node-server/src/utils/auth.util.ts` (`authentication` middleware), `src/services/auth.service.ts`, `src/services/encryption.service.ts`, `src/utils/encryption.util.ts`, `src/utils/jwt.ts`.
+
+## Data ownership
+
+| Store | Holds | Defined in |
+|---|---|---|
+| MongoDB | Users, ApiKeys (unused), Keystores, UserKeyPairs, Workspaces, Messages | `node-server/src/models/` |
+| S3 | Original uploads, flat keys `timestamp-filename` with no per-user prefix | `node-server/src/middlewares/multer.middleware.ts` |
+| Milvus | One collection per workspace slug | `python-server/app/core/vector_stores/milvus.py` |
+| BM25 files | One pickle per workspace slug, relative to python-server's working directory | `python-server/app/core/indices/bm25_index.py` |
+
+Chat history is a single Message document per workspace slug. Each Q&A pair is pushed onto its `messages` array (`node-server/src/repositories/message.repo.ts`).
+
+## Offline pipelines
+
+`translator/` and `llm/` do not run with the app. They produced the model that the app calls.
 
 ```mermaid
 graph LR
-    File["PDF/DOCX/TXT File<br/>(from S3)"] -->|Download| Loader["FileLoader<br/>(pypdf, python-docx)"]
-    
-    Loader -->|Extract text| Split["TextSplitter<br/>(sentence-level,<br/>512 tok, 128 ov)"]
-    
-    Split -->|List of chunks| Embed["Embedding Model<br/>(BAAI/bge-m3,<br/>batch_size=32)"]
-    
-    Embed -->|Embeddings<br/>1024-dim| MilvusStore["MilvusStore<br/>(add_vectors)"]
-    
-    Embed -->|Chunk text| BM25Build["BM25Index.build<br/>(VinAI tokenizer<br/>for Vietnamese)"]
-    
-    MilvusStore -->|Indexed vectors| Milvus["Milvus Collection<br/>(L2/COSINE metric)"]
-    
-    BM25Build -->|Persisted| BM25File["bm25_indices/<br/>collection.pkl"]
-    
-    MilvusStore -->|Result| Result["EmbedResult:<br/>status, chunks, files"]
+    DS["English instruction datasets<br/>(Alpaca, OpenOrca, Dolly, ...)"] --> T["translator/<br/>VinAI en→vi"]
+    T --> J["Vietnamese JSON datasets"]
+    J --> F["llm/main.py<br/>unsloth LoRA on Llama 3.2 3B"]
+    F --> HF["Hugging Face Hub"]
+    HF --> V["vLLM on GCP<br/>(deployment-guide.md)"]
 ```
-
----
-
-## Authentication & Key Rotation Flow
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant NodeAPI
-    participant MongoDB
-    participant JWT
-
-    Client->>NodeAPI: POST /api/auth/register<br/>{email, password}
-    NodeAPI->>NodeAPI: Hash password (bcrypt, 12 rounds)
-    NodeAPI->>MongoDB: Create User + UserKeyPair
-    NodeAPI->>NodeAPI: Generate RSA 2048 keypair
-    NodeAPI->>MongoDB: Encrypt privKey with MASTER_ENCRYPTION_KEY
-    NodeAPI-->>Client: User ID
-
-    Client->>NodeAPI: POST /api/auth/login<br/>{email, password}
-    NodeAPI->>MongoDB: Fetch User
-    NodeAPI->>NodeAPI: Compare password hash
-    NodeAPI->>JWT: Sign token (RS256, privateKey)
-    NodeAPI->>MongoDB: Store refreshToken in Keystore
-    NodeAPI-->>Client: {accessToken, refreshToken, expiresIn}
-
-    Client->>NodeAPI: Request with accessToken
-    NodeAPI->>MongoDB: Fetch user's publicKey
-    NodeAPI->>JWT: Verify token signature
-    NodeAPI-->>Client: Response (if valid)
-
-    Client->>NodeAPI: POST /api/auth/refresh-token
-    NodeAPI->>MongoDB: Lookup refreshToken in Keystore
-    NodeAPI->>JWT: Issue new accessToken
-    NodeAPI-->>Client: {accessToken, expiresIn}
-
-    Client->>NodeAPI: POST /api/auth/rotate-keys
-    NodeAPI->>NodeAPI: Generate new RSA keypair
-    NodeAPI->>MongoDB: Update UserKeyPair + Keystore
-    NodeAPI-->>Client: Key rotation complete
-```
-
----
-
-## Encryption/Decryption Flow
-
-```mermaid
-graph TB
-    subgraph ClientSide["Client Side"]
-        PlainData["Plaintext Data"]
-        PublicKey["User's Public Key<br/>(from /api/auth/public-key)"]
-        Encrypt["Browser Crypto<br/>RSA-OAEP"]
-        CipherData["Ciphertext"]
-    end
-
-    subgraph ServerSide["Server Side"]
-        Request["POST /api/auth/encrypt<br/>{data}"]
-        GetPrivKey["Fetch encryptedPrivKey<br/>from MongoDB"]
-        DecryptPriv["Decrypt privKey<br/>using MASTER_ENCRYPTION_KEY"]
-        EncryptData["RSA-OAEP encrypt<br/>with public key"]
-        ResponseEnc["Return encrypted data"]
-    end
-
-    subgraph DecryptSide["Decryption"]
-        GetEncryptedPrivKey["Fetch encryptedPrivKey<br/>from MongoDB"]
-        DecryptPrivKey["Decrypt using MASTER_KEY"]
-        DecryptRequest["POST /api/auth/decrypt<br/>{ciphertext}"]
-        RSADecrypt["RSA-OAEP decrypt<br/>with private key"]
-        PlaintextResponse["Return plaintext"]
-    end
-
-    PlainData --> PublicKey
-    PublicKey --> Encrypt
-    Encrypt --> CipherData
-    CipherData --> Request
-    
-    Request --> GetPrivKey
-    GetPrivKey --> DecryptPriv
-    DecryptPriv --> EncryptData
-    EncryptData --> ResponseEnc
-    
-    CipherData -.->|For decryption| GetEncryptedPrivKey
-    GetEncryptedPrivKey --> DecryptPrivKey
-    DecryptPrivKey --> DecryptRequest
-    DecryptRequest --> RSADecrypt
-    RSADecrypt --> PlaintextResponse
-```
-
----
-
-## Workspace Isolation Architecture
-
-```mermaid
-graph TB
-    subgraph User1["User 1 (ABC123)"]
-        WS1["Workspace A<br/>slug: ws-prod"]
-        Files1["files.pdf<br/>data.docx"]
-        Msgs1["Message history"]
-    end
-
-    subgraph User2["User 2 (XYZ789)"]
-        WS2["Workspace B<br/>slug: ws-test"]
-        Files2["report.pdf"]
-        Msgs2["Message history"]
-    end
-
-    subgraph MongoDB["MongoDB Collections"]
-        Users["Users Collection"]
-        Workspaces["Workspaces Collection"]
-        Messages["Messages Collection"]
-        KeyPairs["UserKeyPair Collection"]
-    end
-
-    subgraph S3["AWS S3 Bucket"]
-        S3User1["User1/<br/>ws-prod/"]
-        S3User2["User2/<br/>ws-test/"]
-    end
-
-    subgraph Milvus["Milvus Collections"]
-        Milvus1["ws-prod<br/>(User1)"]
-        Milvus2["ws-test<br/>(User2)"]
-    end
-
-    User1 --> WS1
-    WS1 --> Files1
-    WS1 --> Msgs1
-
-    User2 --> WS2
-    WS2 --> Files2
-    WS2 --> Msgs2
-
-    WS1 -.->|Query checks<br/>userId| Users
-    WS1 -.->|Isolation layer| Workspaces
-    Msgs1 -.->|workspaceSlug<br/>match| Messages
-
-    Files1 -.->|S3 prefix| S3User1
-    Files2 -.->|S3 prefix| S3User2
-
-    WS1 -.->|Collection<br/>name| Milvus1
-    WS2 -.->|Collection<br/>name| Milvus2
-```
-
----
-
-## Docker Compose Service Dependencies
-
-```mermaid
-graph TD
-    subgraph MilvusStack["Milvus Stack"]
-        ETCD["ETCD<br/>v3.5.5<br/>port: 2379"]
-        MinIO["MinIO<br/>port: 9000/9001"]
-        Milvus["Milvus<br/>v2.3.3<br/>port: 19530"]
-    end
-
-    subgraph Services["Application Services"]
-        PyServer["python-server<br/>FastAPI<br/>port: 8080"]
-        NodeServer["node-server<br/>Express<br/>port: 3001→3000"]
-        Client["client<br/>Next.js<br/>port: 3000"]
-    end
-
-    subgraph External["External Dependencies"]
-        MongoDB["MongoDB<br/>(Atlas or local)"]
-        S3["AWS S3"]
-        ExtLLM["External LLM<br/>(HTTP endpoint)"]
-    end
-
-    ETCD --> Milvus
-    MinIO --> Milvus
-    Milvus --> PyServer
-    
-    PyServer --> NodeServer
-    NodeServer --> Client
-    
-    PyServer -.->|MILVUS_URI| Milvus
-    NodeServer -.->|DB_URL| MongoDB
-    NodeServer -.->|S3 creds| S3
-    PyServer -.->|HTTP POST| ExtLLM
-```
-
----
-
-## Data Model Relationships
-
-```mermaid
-erDiagram
-    USER ||--o{ WORKSPACE : owns
-    USER ||--o{ KEYSTORE : has
-    USER ||--o{ USERKEYPAIR : "has RSA"
-    
-    WORKSPACE ||--o{ MESSAGE : contains
-    WORKSPACE ||--o{ FILE : has
-    
-    MESSAGE ||--o{ SOURCE_DOC : references
-    
-    USER {
-        ObjectId _id
-        string email
-        string password_hash
-        datetime created_at
-    }
-    
-    WORKSPACE {
-        ObjectId _id
-        string slug
-        ObjectId userId
-        string name
-        boolean isEmbedded
-        array filePaths
-        array fileKeys
-        datetime created_at
-    }
-    
-    MESSAGE {
-        ObjectId _id
-        string workspaceSlug
-        array messages
-        datetime created_at
-    }
-    
-    FILE {
-        string name
-        string key
-        string s3_url
-        int fileSize
-        array chunks
-    }
-    
-    SOURCE_DOC {
-        string content
-        object metadata
-        float score
-        string source_file
-    }
-    
-    KEYSTORE {
-        string userId
-        string publicKey
-        string refreshToken
-        string signature
-        string keyId
-    }
-    
-    USERKEYPAIR {
-        string userId
-        string encryptedPrivateKey
-        string algorithm
-        string status
-    }
-```
-
----
-
-## Hybrid Search Fusion Logic
-
-```mermaid
-graph LR
-    Query["User Query"]
-    QEmbed["Embed Query<br/>(BAAI/bge-m3)"]
-    
-    subgraph DenseSearch["Dense Search"]
-        MVSearch["Milvus.search<br/>k=20"]
-        MVResults["Dense Results<br/>with scores"]
-    end
-    
-    subgraph SparseSearch["Sparse Search"]
-        BM25Search["BM25.search<br/>k=20"]
-        BM25Results["Sparse Results<br/>with scores"]
-    end
-    
-    Query --> QEmbed
-    QEmbed --> MVSearch
-    QEmbed --> BM25Search
-    
-    MVSearch --> MVResults
-    BM25Search --> BM25Results
-    
-    MVResults --> Fusion{Fusion Method}
-    BM25Results --> Fusion
-    
-    Fusion -->|RRF| RRFMethod["Reciprocal Rank Fusion<br/>score = 1/(k + rank)"]
-    Fusion -->|Linear| LinearMethod["Weighted Sum<br/>score = 0.6*dense + 0.4*sparse"]
-    
-    RRFMethod --> Normalize["Normalize & Sort"]
-    LinearMethod --> Normalize
-    
-    Normalize --> TopK["Select Top-5"]
-    TopK --> Rerank["Re-ranker<br/>(cross-encoder)"]
-    Rerank --> Final["Final Top-5"]
-```
-
----
-
-## Re-ranking Pipeline
-
-```mermaid
-sequenceDiagram
-    participant Fusion as Fused Results<br/>k=5-10
-    participant Reranker as Cross-encoder Model<br/>ms-marco-MiniLM-L-6-v2
-    participant Score as Scoring
-    participant Output as Top-5 Ranked
-
-    Fusion->>Reranker: For each pair<br/>(query, doc)
-    
-    loop For k documents
-        Reranker->>Score: Compute relevance score<br/>(0 to 1)
-        Score-->>Reranker: Score
-    end
-    
-    Reranker-->>Output: Sort by score (descending)
-    Output-->>Output: Select top-5
-```
-
----
-
-## Error Handling & Recovery
-
-```mermaid
-graph TD
-    Request["Incoming Request"]
-    
-    Request --> Auth{Auth Valid?}
-    Auth -->|No| AuthErr["UnauthorizedError<br/>401"]
-    Auth -->|Yes| Validate{Data Valid?}
-    
-    Validate -->|No| ValErr["BadRequestError<br/>400"]
-    Validate -->|Yes| Resource{Resource Exists?}
-    
-    Resource -->|No| NotFound["NotFoundError<br/>404"]
-    Resource -->|Yes| Permission{User Owned?}
-    
-    Permission -->|No| Forbidden["ForbiddenError<br/>403"]
-    Permission -->|Yes| Process["Process Request"]
-    
-    Process --> Success{Success?}
-    Success -->|Yes| Return["SuccessResponse<br/>200/201"]
-    Success -->|No| ServerErr["InternalServerError<br/>500"]
-    
-    AuthErr --> Middleware["Error Middleware"]
-    ValErr --> Middleware
-    NotFound --> Middleware
-    Forbidden --> Middleware
-    ServerErr --> Middleware
-    
-    Middleware --> Log["Log Error<br/>(Winston)"]
-    Log --> Response["JSON Response<br/>+ statusCode + message"]
-    Response --> Client["Return to Client"]
-    Return --> Client
-```
-
----
-
-## Monitoring & Observability
-
-```mermaid
-graph TB
-    subgraph Logs["Logging"]
-        NodeLog["Node.js<br/>(Winston)<br/>→ logs/app-YYYY-MM-DD.log"]
-        PyLog["Python<br/>(logging)<br/>→ stdout/stderr"]
-    end
-    
-    subgraph Metrics["Metrics"]
-        ReqCount["Request Count<br/>by endpoint"]
-        LatencyP95["Latency P95<br/>(endpoint, method)"]
-        ErrorRate["Error Rate<br/>by status code"]
-    end
-    
-    subgraph Health["Health Checks"]
-        NodeHealth["Node: GET /health"]
-        PyHealth["Python: GET /"]
-        MilvusHealth["Milvus: /healthz"]
-        MongoHealth["MongoDB: ping"]
-    end
-    
-    subgraph Alerts["Alerts"]
-        ServiceDown["Service down<br/>(health check fails)"]
-        ErrorRate10["Error rate > 10%<br/>(5xx errors)"]
-        LatencyP95High["Latency P95 > 5s<br/>(slow endpoint)"]
-    end
-    
-    Logs --> Metrics
-    Health --> Alerts
-    Metrics --> Alerts
-```
-
----
-
-## Technology Stack Summary
-
-| Layer | Technology | Version | Purpose |
-|-------|-----------|---------|---------|
-| **Frontend** | Next.js | 14.2.5 | SSR + App Router |
-| | React | 18.2.0 | UI components |
-| | Tailwind CSS | 3.3.2 | Styling |
-| | TypeScript | 4.9.5 | Type safety |
-| | TanStack React Query | 5.52.1 | State mgmt |
-| **Backend API** | Express | 4.21.2 | HTTP framework |
-| | TypeScript | 5.7.3 | Type safety |
-| | Mongoose | 8.10.1 | MongoDB ODM |
-| | JWT | 9.0.2 | Authentication (RS256) |
-| | AWS SDK | v3 | S3 uploads |
-| | Winston | 3.17.0 | Logging |
-| **RAG Service** | FastAPI | 0.115.12 | Python async API |
-| | BAAI/bge-m3 | 1.3.4 | Embeddings (1024-dim) |
-| | pymilvus | 2.4.10 | Vector DB client |
-| | rank-bm25 | 0.2.2 | Keyword search |
-| | transformers | 4.51.3 | ML models |
-| **Infrastructure** | Milvus | 2.3.3 | Vector database |
-| | MongoDB | 5.0+ | Document store |
-| | AWS S3 | - | File storage |
-| | Docker | - | Containerization |
-| | Docker Compose | - | Orchestration |
-
----
-
-## Deployment Architecture (Production)
-
-```mermaid
-graph TB
-    subgraph CloudInfra["Cloud Infrastructure"]
-        ALB["Application Load Balancer"]
-        K8S["Kubernetes Cluster"]
-    end
-    
-    subgraph K8SPods["K8S Pods"]
-        ClientPod["Client Pod<br/>Next.js x3"]
-        APIPod["API Pod<br/>Express x5"]
-        RAGPod["RAG Pod<br/>FastAPI x2"]
-    end
-    
-    subgraph Managed["Managed Services"]
-        MongoDB["MongoDB Atlas"]
-        S3["AWS S3"]
-        ECR["AWS ECR<br/>(Image Registry)"]
-    end
-    
-    subgraph VectorDB["Vector Database"]
-        MilvusCluster["Milvus Cluster<br/>(HA mode)"]
-    end
-    
-    subgraph Monitoring["Observability"]
-        Prometheus["Prometheus<br/>(Metrics)"]
-        Grafana["Grafana<br/>(Dashboards)"]
-        CloudWatch["CloudWatch<br/>(Logs)"]
-    end
-    
-    Users["Users<br/>(HTTPS)"] --> ALB
-    ALB --> K8S
-    K8S --> K8SPods
-    
-    ClientPod --> APIPod
-    APIPod --> MongoDB
-    APIPod --> S3
-    APIPod --> RAGPod
-    RAGPod --> MilvusCluster
-    
-    ECR -.->|Pull images| K8SPods
-    
-    K8SPods -.->|Metrics| Prometheus
-    Prometheus -.-> Grafana
-    K8SPods -.->|Logs| CloudWatch
-```
-
-Currently deployed on **Docker Compose (single-machine)**. See [deployment-guide.md](./deployment-guide.md) for setup instructions.

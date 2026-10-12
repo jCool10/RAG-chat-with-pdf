@@ -17,8 +17,8 @@ import random
 
 
 # Set environment variables and constants
-os.environ["HF_TOKEN"] = "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"
-HF_TOKEN = "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"
+# Read from the environment; never hardcode Hub tokens
+HF_TOKEN = os.environ["HF_TOKEN"]
 MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
 OUTPUT_MODEL_NAME = "jCool10/chat_anything-3B"
 DATASET_PATH = "/workspace/dataset/*.json"

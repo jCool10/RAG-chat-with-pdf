@@ -17,6 +17,9 @@ build
 .env.test
 .env.production
 
+# Credentials that must never enter an image
+config.json
+
 # Logs
 logs
 *.log

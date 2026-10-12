@@ -1,55 +1,64 @@
-import { NotFoundError, UnauthorizedError, ForbiddenError } from '@/core/error.response'
+import { UnauthorizedError } from '@/core/error.response'
 import catchAsync from '@/helpers/cathAsync'
 import { KeystoreModel } from '@/models/keyStore.model'
-import { keyStoreService } from '@/services/keyStore,service'
 import { NextFunction, Request, Response } from 'express'
+import { TokenExpiredError } from 'jsonwebtoken'
 import mongoose from 'mongoose'
 import { verifyToken } from './jwt'
 import { ApiKeyModel } from '@/models/apiKey.model'
 
-export const authentication = catchAsync(async (req: Request, res: Response, next: NextFunction) => {
-  const accessToken = req.headers['authorization'] as string
-  const refreshToken = req.headers['refresh-token'] as string
-  const clientId = req.headers['client-id'] as string
-
-  console.log(accessToken, refreshToken, clientId)
-
-  if (!accessToken && !refreshToken) {
+// Tokens are signed with a per-user key, so the client-id header selects the public key to verify with
+const findKeyStore = async (clientId?: string) => {
+  if (!clientId || !mongoose.isValidObjectId(clientId)) {
     throw new UnauthorizedError('Unauthorized')
   }
 
   const keyStore = await KeystoreModel.findOne({ client: new mongoose.Types.ObjectId(clientId) }).lean()
 
-  console.log(keyStore)
-
   if (!keyStore) {
-    throw new NotFoundError('Key not found')
-  }
-
-  if (refreshToken) {
-    const decodedUser = verifyToken(refreshToken, keyStore.publicKey)
-
-    if (!decodedUser) {
-      throw new UnauthorizedError('Unauthorized')
-    }
-
-    console.log(decodedUser)
-    console.log(keyStore)
-
-    req.user = decodedUser
-    req.keyStore = keyStore
-
-    return next()
-  }
-
-  const decodedUser = verifyToken(accessToken, keyStore.publicKey)
-
-  if (!decodedUser) {
     throw new UnauthorizedError('Unauthorized')
   }
 
-  req.user = decodedUser
+  return keyStore
+}
+
+// client/utils/axios.ts refreshes on "jwt expired" and logs the user out on "Unauthorized"
+const decodeToken = (token: string, publicKey: string) => {
+  try {
+    return verifyToken(token, publicKey)
+  } catch (error) {
+    throw new UnauthorizedError(error instanceof TokenExpiredError ? 'jwt expired' : 'Unauthorized')
+  }
+}
+
+export const authentication = catchAsync(async (req: Request, res: Response, next: NextFunction) => {
+  const accessToken = req.headers['authorization'] as string | undefined
+
+  if (!accessToken) {
+    throw new UnauthorizedError('Unauthorized')
+  }
+
+  const keyStore = await findKeyStore(req.headers['client-id'] as string | undefined)
+
+  req.user = decodeToken(accessToken, keyStore.publicKey)
   req.keyStore = keyStore
+
+  return next()
+})
+
+// Only the refresh endpoint accepts a refresh token; every other route requires an access token
+export const refreshAuthentication = catchAsync(async (req: Request, res: Response, next: NextFunction) => {
+  const refreshToken = req.headers['refresh-token'] as string | undefined
+
+  if (!refreshToken) {
+    throw new UnauthorizedError('Unauthorized')
+  }
+
+  const keyStore = await findKeyStore(req.headers['client-id'] as string | undefined)
+
+  req.user = decodeToken(refreshToken, keyStore.publicKey)
+  req.keyStore = keyStore
+  req.refreshToken = refreshToken
 
   return next()
 })

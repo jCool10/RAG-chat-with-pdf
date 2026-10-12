@@ -1,4 +1,5 @@
 import * as dotenv from 'dotenv'
+import { tmpdir } from 'os'
 dotenv.config()
 
 export const configs = {
@@ -21,8 +22,15 @@ export const configs = {
   huggingFace: {
     apiKey: process.env.HUGGINGFACEHUB_API_KEY || ''
   },
-  redis: {
-    url: process.env.REDIS_URL || ''
+  rag: {
+    // python-server base URL; the NODE_ENV fallback keeps older setups working
+    url:
+      process.env.RAG_API_URL ||
+      (process.env.NODE_ENV === 'production' ? 'http://python-server:8080' : 'http://0.0.0.0:8080')
+  },
+  upload: {
+    // Downloads are handed to python-server by path, so in Docker this must be a volume both containers mount
+    tmpDir: process.env.UPLOAD_TMP_DIR || tmpdir()
   },
   mongodb: {
     name: process.env.DB_NAME || '',
@@ -33,9 +41,6 @@ export const configs = {
     minPoolSize: parseInt(process.env.DB_MIN_POOL_SIZE || '5'),
     maxPoolSize: parseInt(process.env.DB_MAX_POOL_SIZE || '10'),
     url: process.env.DB_URL || ''
-  },
-  firebase: {
-    credential: JSON.parse(process.env.FIREBASE_CREDENTIAL || '{}')
   },
   tokenInfo: {
     accessTokenValidity: parseInt(process.env.ACCESS_TOKEN_VALIDITY_SEC || '0'),

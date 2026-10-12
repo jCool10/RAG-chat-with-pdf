@@ -3,9 +3,26 @@ import workspaceRepo from '@/repositories/worksapce.repo'
 import { downloadFile } from '@/utils/s3'
 import messageRepo from '@/repositories/message.repo'
 import axios from 'axios'
+import { configs } from '@/configs'
 import { BadRequestError, NotFoundError } from '@/core/error.response'
 
-const RAG_API_URL = process.env.NODE_ENV === 'production' ? 'http://python-server:8080' : 'http://0.0.0.0:8080'
+const RAG_API_URL = configs.rag.url
+
+// Q&A pairs sent to the LLM as conversation history; the model context is 4096 tokens
+const HISTORY_PAIRS = 3
+
+// Slug lookups must be scoped to the caller, or any logged-in user could read another user's workspace.
+// A foreign slug is reported as missing so existence does not leak.
+const findOwnedWorkspace = async (req: Request, workspaceSlug: string) => {
+  const { user } = req.user
+  const workspace = await workspaceRepo.findBySlugAndUser(workspaceSlug, user._id)
+
+  if (!workspace) {
+    throw new NotFoundError('Workspace not found')
+  }
+
+  return workspace
+}
 
 class filesService {
   async embedFiles(req: Request) {
@@ -49,11 +66,7 @@ class filesService {
   async reEmbedFiles(req: Request) {
     const { workspaceSlug } = req.body
 
-    const workspace = await workspaceRepo.findBySlug(workspaceSlug)
-
-    if (!workspace) {
-      throw new NotFoundError('Workspace not found')
-    }
+    const workspace = await findOwnedWorkspace(req, workspaceSlug)
 
     const result = await axios.post(`${RAG_API_URL}/embed`, {
       file_paths: workspace.filePaths,
@@ -83,6 +96,7 @@ class filesService {
 
   async getMessages(req: Request) {
     const { workspaceSlug } = req.params
+    await findOwnedWorkspace(req, workspaceSlug)
     const messages = await messageRepo.getMessages(workspaceSlug)
     return messages
   }
@@ -96,11 +110,7 @@ class filesService {
 
   async getWorkspace(req: Request) {
     const { workspaceSlug } = req.params
-    const workspace = await workspaceRepo.findBySlug(workspaceSlug)
-
-    if (!workspace) {
-      throw new NotFoundError('Workspace not found')
-    }
+    const workspace = await findOwnedWorkspace(req, workspaceSlug)
 
     const messages = await messageRepo.getMessages(workspaceSlug)
 
@@ -113,17 +123,24 @@ class filesService {
   async queryWorkspace(req: Request) {
     const { workspaceSlug } = req.params
     const { question } = req.body
+
+    if (!question) {
+      throw new BadRequestError('Question is required')
+    }
+
+    await findOwnedWorkspace(req, workspaceSlug)
     const messages = await messageRepo.getMessages(workspaceSlug, 3)
+
+    // One Message document holds the whole conversation; send only the most recent exchanges
+    const history = messages.flatMap((message) => message.messages.map((msg) => msg.message)).slice(-HISTORY_PAIRS * 2)
 
     const response = await axios.post(`${RAG_API_URL}/query`, {
       query: question,
       collection_name: workspaceSlug,
-      history: messages.flatMap((message) => message.messages.map((msg) => msg.message))
+      history
     })
 
     const responseData = response.data.data
-
-    console.log(responseData)
 
     const sourceDocuments = responseData.docs.map((doc: any) => ({
       text: doc.text,

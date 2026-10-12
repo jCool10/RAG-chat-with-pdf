@@ -10,6 +10,10 @@ async function findBySlug(slug: string) {
   return WorkspaceModel.findOne({ slug }).lean()
 }
 
+async function findBySlugAndUser(slug: string, userId: string) {
+  return WorkspaceModel.findOne({ slug, user: userId }).lean()
+}
+
 async function findByUserId(userId: string) {
   return WorkspaceModel.find({ user: userId }).lean()
 }
@@ -21,6 +25,7 @@ async function updateOne(filter: FilterQuery<Workspace>, update: UpdateQuery<Wor
 export default {
   create,
   findBySlug,
+  findBySlugAndUser,
   findByUserId,
   updateOne
 }

@@ -24,7 +24,12 @@ def read_root():
 
 @app.post("/query")
 def query(request: QueryRequest):
-    return rag_service.query_documents(request.query, request.collection_name, request.history)
+    # Keyword arguments: the third positional parameter is use_hybrid, not history
+    return rag_service.query_documents(
+        query=request.query,
+        collection_name=request.collection_name,
+        history=request.history,
+    )
 
 @app.post("/embed")
 def embed(request: EmbedRequest):

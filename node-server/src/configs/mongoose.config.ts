@@ -14,14 +14,13 @@ const options = {
   socketTimeoutMS: 45000 // Close sockets after 45 seconds of inactivity
 }
 
-logger.debug(dbURI)
-
 function setRunValidators() {
   mongoose.set('runValidators', true)
 }
 
 mongoose.set('strictQuery', true)
-mongoose.set('debug', true)
+// Query logging prints filter values (emails, ids); keep it out of production logs
+mongoose.set('debug', configs.app.env !== 'production')
 
 // Create the database connection
 mongoose
@@ -43,7 +42,7 @@ mongoose
 // CONNECTION EVENTS
 // When successfully connected
 mongoose.connection.on('connected', () => {
-  logger.debug('Mongoose default connection open to ' + dbURI)
+  logger.debug('Mongoose default connection open')
 })
 
 // If the connection throws an error

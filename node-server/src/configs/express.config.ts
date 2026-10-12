@@ -1,34 +1,21 @@
 'use strict'
 
 import express, { Application } from 'express'
-import bodyParser from 'body-parser'
 import compression from 'compression'
 import cors from 'cors'
 import helmet from 'helmet'
 import morgan from 'morgan'
 import expressWinston from 'express-winston'
-import multer from 'multer'
-import { rateLimit } from 'express-rate-limit'
-import Redis from 'ioredis'
-import { configs } from '.'
 import logger from './logger.config'
 
-const url = configs.redis.url
-
-const FILE_LIMIT = '3GB'
-const upload = multer({ dest: 'uploads/' })
+// JSON/text bodies are small (questions, auth payloads); files arrive as multipart and are capped in multer.middleware.ts
+const BODY_LIMIT = '1mb'
 
 export default (app: Application) => {
   app.use(morgan('dev'))
-  app.use(bodyParser.text({ limit: FILE_LIMIT }))
-  app.use(bodyParser.json({ limit: FILE_LIMIT }))
-  app.use(bodyParser.json())
-  app.use(
-    bodyParser.urlencoded({
-      limit: FILE_LIMIT,
-      extended: true
-    })
-  )
+  app.use(express.text({ limit: BODY_LIMIT }))
+  app.use(express.json({ limit: BODY_LIMIT }))
+  app.use(express.urlencoded({ limit: BODY_LIMIT, extended: true }))
   app.use(
     compression({
       level: 6,
@@ -39,12 +26,6 @@ export default (app: Application) => {
     })
   )
   app.use(helmet())
-  app.use(express.json())
-  app.use(express.urlencoded({ extended: true }))
-
-  app.post('/upload', upload.single('file'), (req, res) => {
-    console.log('Upload File', req.file)
-  })
 
   const whiteList = ['http://localhost:3000']
   app.use(
@@ -57,7 +38,9 @@ export default (app: Application) => {
   app.use(
     expressWinston.logger({
       winstonInstance: logger,
-      statusLevels: true
+      statusLevels: true,
+      // Request headers are logged by default; these carry credentials
+      headerBlacklist: ['authorization', 'refresh-token', 'cookie']
     })
   )
 

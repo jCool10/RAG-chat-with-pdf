@@ -1,6 +1,7 @@
 import { authController } from '@/controllers/auth.controller'
 import catchAsync from '@/helpers/cathAsync'
-import { authentication } from '@/utils/auth.util'
+import { authRateLimit } from '@/middlewares/rate-limit.middleware'
+import { authentication, refreshAuthentication } from '@/utils/auth.util'
 import { Router } from 'express'
 
 export const authRouter = (router: Router) => {
@@ -9,14 +10,16 @@ export const authRouter = (router: Router) => {
   router.use('/auth', router)
 
   // Public routes (no authentication required)
-  router.post('/register', catchAsync(AuthController.register))
-  router.post('/login', catchAsync(AuthController.login))
+  router.post('/register', authRateLimit, catchAsync(AuthController.register))
+  router.post('/login', authRateLimit, catchAsync(AuthController.login))
+
+  // Authenticated by the refresh-token header, so it must be registered before the access-token guard
+  router.post('/refresh-token', refreshAuthentication, catchAsync(AuthController.refreshToken))
 
   // Protected routes (authentication required)
   router.use(authentication)
 
   router.post('/logout', catchAsync(AuthController.logout))
-  router.post('/refresh-token', catchAsync(AuthController.refreshToken))
 
   // Encryption and security routes
   router.post('/rotate-keys', catchAsync(AuthController.rotateKeys))

@@ -173,6 +173,15 @@ class RAGService:
             f"Completed embedding {total_files} files. Success: {successful}, Failed: {failed}"
         )
 
+        # Nothing was indexed, so the workspace would be unusable; let the caller see the failure
+        if successful == 0:
+            return {
+                "code": 500,
+                "success": False,
+                "message": "; ".join(res.get("message", "") for res in results) or "No documents were embedded",
+                "data": {"embedding_results": results, "bm25_index": None},
+            }
+
         # Build BM25 index if hybrid search is enabled
         bm25_result = None
         if self.config.get("hybrid_search", {}).get("enabled", False) and all_chunks:
@@ -216,6 +225,9 @@ class RAGService:
         # Combine all documents into a single context
         context = "\n".join(context_parts)
 
+        # node-server sends alternating question/answer strings, oldest first
+        history_text = "\n".join(history) if history else ""
+
         # Create the prompt with instructions, context and query
         prompt = f"""
         Bạn là một trợ lý thông minh. Dựa vào các đoạn ngữ cảnh được cung cấp, hãy trả lời câu hỏi của người dùng một cách chính xác, rõ ràng và tự nhiên.
@@ -223,8 +235,8 @@ class RAGService:
         Ngữ cảnh:
         {context}
 
-        {"LỊCH SỬ CUỘC TRÒ CHUYỆN:" if history else ""}
-        {history}
+        {"LỊCH SỬ CUỘC TRÒ CHUYỆN:" if history_text else ""}
+        {history_text}
 
         Câu hỏi hiện tại:
         {query}

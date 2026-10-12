@@ -73,15 +73,19 @@ services:
     environment:
       - PYTHONPATH=/app
       - MILVUS_URI=http://milvus:19530
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-BAAI/bge-base-en-v1.5}
       - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+    # No auth on this service: reachable from the host for debugging only, never from the network
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./python-server/data:/app/data
       - ./python-server/volumes:/app/volumes
+      # node-server downloads uploads here and sends the paths to /embed
+      - upload_tmp:/shared/uploads:ro
     depends_on:
-      - milvus
+      # RAGService connects to Milvus at import time
+      milvus:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/"]
       interval: 30s
@@ -95,13 +99,19 @@ services:
   node-server:
     build:
       context: ./node-server
-      dockerfile: Dockerfile
+      dockerfile: dockerfile
     container_name: capstone_node_server
     restart: unless-stopped
     environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - RAG_API_URL=http://python-server:8080
+      - UPLOAD_TMP_DIR=/shared/uploads
       - DB_URL=${DB_URL}
-      - ACCESS_TOKEN_VALIDITY_SEC=${ACCESS_TOKEN_VALIDITY_SEC}
-      - REFRESH_TOKEN_VALIDITY_SEC=${REFRESH_TOKEN_VALIDITY_SEC}
+      - ACCESS_TOKEN_VALIDITY_SEC=${ACCESS_TOKEN_VALIDITY_SEC:-3600}
+      - REFRESH_TOKEN_VALIDITY_SEC=${REFRESH_TOKEN_VALIDITY_SEC:-86400}
+      - MASTER_ENCRYPTION_KEY=${MASTER_ENCRYPTION_KEY}
+      - MASTER_SECRET=${MASTER_SECRET}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_REGION=${AWS_REGION}
@@ -109,12 +119,13 @@ services:
     ports:
       - "3001:3000"
     volumes:
-      - ./node-server/uploads:/app/uploads
       - ./node-server/logs:/app/logs
+      - upload_tmp:/shared/uploads
     depends_on:
       - python-server
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      # alpine images ship busybox wget, not curl
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthCheck"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -126,18 +137,17 @@ services:
     build:
       context: ./client
       dockerfile: dockerfile
+      args:
+        # Baked into the browser bundle at build time: node-server as the browser sees it, trailing slash, no /api
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001/}
     container_name: capstone_client
     restart: unless-stopped
-    environment:
-      - NODE_ENV=${NODE_ENV:-production}
-      - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
-      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:3001/api}
     ports:
       - "3000:3000"
     depends_on:
       - node-server
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -150,6 +160,8 @@ volumes:
   minio_data:
     driver: local
   milvus_data:
+    driver: local
+  upload_tmp:
     driver: local
 
 networks:

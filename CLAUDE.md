@@ -2,133 +2,53 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Repository layout
+Product intent and architecture are in `README.md` and `docs/`. Before navigating code, read `docs/codebase-summary.md`. Before trusting any behavior, check `docs/project-roadmap.md`, which lists verified bugs.
 
-Polyglot monorepo (no workspace manager). Each service has its own dependencies and is built/run independently.
+## Services
 
-| Path | Stack | Port |
+| Path | Stack | Default port |
 |---|---|---|
-| `client/` | Next.js 14 (App Router), React 18, TypeScript, Tailwind + shadcn/ui | 3000 |
-| `node-server/` | Express 4 + TypeScript, Mongoose, JWT RS256, AWS S3, Winston | 3001 → container 3000 |
-| `python-server/` | FastAPI, BAAI/bge-m3 embeddings, Milvus, BM25, cross-encoder reranker | 8080 |
-| `translator/` | Python EN→VI translation pipeline (VinAI seq2seq, googletrans fallback) | — |
-| `llm/` | Python LoRA fine-tuning (unsloth, PEFT, TRL) for Llama 3.2 3B | — |
+| `client/` | Next.js 14 App Router, shadcn/ui, yarn | 3000 |
+| `node-server/` | Express + TypeScript, Mongoose, yarn | 8000 (`PORT`) |
+| `python-server/` | FastAPI, Milvus, BM25 | 8080 |
+| `translator/`, `llm/` | Offline Python scripts (dataset translation, LoRA fine-tune) | — |
 
-Infra services (via `docker-compose.yml`): etcd, MinIO (9000/9001), Milvus standalone (19530/9091).
-
-Detailed per-service breakdown: `docs/codebase-summary.md`. Diagrams: `docs/system-architecture.md`.
-
-## Common commands
-
-### Whole stack (Docker)
+## Commands
 
 ```bash
-cp env.example .env                  # then fill in DB_URL, AWS_*, HUGGING_FACE_HUB_TOKEN
-docker-compose up -d                 # wait ~2 min for Milvus init
-docker-compose ps                    # check health
-docker-compose logs -f <service>
-docker-compose down                  # stop; add -v to wipe volumes
+docker-compose up -d etcd minio milvus     # infra only, for local dev; `up -d --build` runs the full stack
+cd python-server && python app/main.py     # must run from python-server/ (relative config.yaml, BM25 dir)
+cd node-server && yarn dev | yarn build | yarn lint | yarn prettier
+cd client && yarn dev | yarn typecheck | yarn format:check | yarn build
 ```
 
-### `client/` (yarn)
+- `node-server` build is `rimraf dist && tsc && tsc-alias`. Never run bare `tsc`: the `@/` imports break.
+- Use Node 22 for node-server. Node 26 crashes at startup inside `jsonwebtoken`'s dependencies.
+- `client` `yarn lint` (`next lint`) is interactive because no ESLint config exists. Do not run it in automation.
+- No tests and no CI exist. **Done** means: typecheck/lint/prettier pass for the TS packages you touched, and you exercised the affected flow against the running stack (health: `:8000/healthCheck`, `:8080/`, `:9091/healthz`). If you could not run it, say so.
 
-```bash
-cd client
-yarn install
-yarn dev                             # http://localhost:3000
-yarn typecheck                       # tsc --noEmit
-yarn lint           / yarn lint:fix
-yarn format:check   / yarn format:write
-yarn build          / yarn start
-```
+## Facts that prevent wrong changes
 
-### `node-server/` (yarn)
+- **Shared upload directory.** node-server sends file *paths* (under `UPLOAD_TMP_DIR`) to python-server `/embed`, so both must read the same directory. Locally that is the OS temp dir; in Compose it is the `upload_tmp` volume.
+- **python-server has no auth.** All auth and ownership checks belong in node-server. Any new slug-based handler must load the workspace through `findOwnedWorkspace` in `node-server/src/services/files.service.ts`.
+- **JWT payload is `{ user: { _id, email, name } }`.** Read the caller as `req.user.user._id`. Only build tokens through `createTokens` (`src/utils/jwt.ts`); never put more user fields in them.
+- **Auth headers:** `authorization` carries the raw access token (no `Bearer`), plus `client-id`. Only `POST /api/auth/refresh-token` reads the `refresh-token` header. The middleware is `node-server/src/utils/auth.util.ts`, not `middlewares/`. Keep the 401 messages: the client refreshes on `jwt expired` and logs out on `Unauthorized`.
+- **`query_documents` arguments:** the third positional parameter is `use_hybrid`, not `history`. Call it with keyword arguments.
+- **`python-server/config.yaml` is partly dead.** Grep `app/` for a key before relying on it. The LLM endpoint is the `LLM_API` constant in `rag_service.py`; do not add more hardcoded hosts.
+- **Index invalidation:** changing chunking, the splitter or the embedding model requires dropping the Milvus collection and `data/bm25_indices/<slug>.pkl` for every workspace.
+- **Env quirks:** `NEXT_PUBLIC_API_URL` is the node origin with a trailing `/` and no `/api`. `ACCESS_TOKEN_VALIDITY_SEC`/`REFRESH_TOKEN_VALIDITY_SEC` default to 0, which means instant expiry. `MASTER_ENCRYPTION_KEY` must never change. Full table: `docs/deployment-guide.md#environment-variables`.
+- **Misspelled filenames** (grep these exact names): `services/keyStore,service.ts`, `repositories/worksapce.repo.ts`, `helpers/cathAsync.ts`.
+- **Dead code:** do not build on it. The unrendered `ProtectedProvider`, the `apikey` middleware, and the unrouted `reEmbedFiles`.
 
-```bash
-cd node-server
-yarn install
-yarn dev                             # nodemon, watches src/
-yarn build                           # rimraf dist + tsc + tsc-alias (path aliases)
-yarn start                           # node dist/index.js
-yarn lint           / yarn lint:fix
-yarn prettier       / yarn prettier:fix
-```
+## Never
 
-**Important:** the build step requires `tsc-alias` to rewrite TS path aliases — running plain `tsc` is not enough.
-
-### `python-server/`
-
-```bash
-cd python-server
-python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-python app/main.py                   # http://localhost:8080
-```
-
-Requires a reachable Milvus (`MILVUS_URI`, defaults to `http://localhost:19530`).
-
-### Tests
-
-No test suites exist yet in any service. Adding them is on the roadmap (`docs/project-roadmap.md`). Until then, verify changes via the running stack and the health endpoints below.
-
-### Health checks
-
-```bash
-curl http://localhost:3000           # Frontend
-curl http://localhost:3001/health    # Node API
-curl http://localhost:8080/          # RAG service
-curl http://localhost:9091/healthz   # Milvus
-```
-
-## Architecture — the big picture
-
-### Request flow (query path)
-
-1. **Browser** → `client/` calls `node-server` with `Authorization`, `refresh-token`, and `client-id` headers (Axios interceptor in `client/utils/axios.ts` handles refresh-on-401 with a batched-pending queue).
-2. **`node-server`** verifies the JWT against the per-user public key stored in the `Keystore` collection (RS256). Workspace ownership is enforced by `userId` checks in `FilesService`.
-3. For `POST /api/files/workspace/:slug/query`, `node-server` forwards the query to `python-server` at `POST /query` (`http://python-server:8080` in Docker, `http://0.0.0.0:8080` locally).
-4. **`python-server`** runs the RAG pipeline:
-   - **Hybrid retrieve** — Milvus dense search (k=20) + BM25 sparse search (k=20, Vietnamese-aware via `underthesea`, falls back to simple split). Fused via RRF (`k=60`) by default, or linear blend (α=0.6 dense / 0.4 sparse).
-   - **Rerank** — cross-encoder `ms-marco-MiniLM-L-6-v2` selects final top-5.
-   - **LLM** — remote HTTP call to `35.221.160.224:8000/v1/chat/completions` (currently hardcoded; see roadmap).
-5. Response returns through `node-server` (wrapped in `SuccessResponse`) to the chat UI with source documents attached.
-
-### Embed path
-
-`POST /api/files/embed` (multipart, max 10 files) → multer-S3 uploads to AWS S3 → `node-server` downloads to OS tmpdir → calls `python-server` `POST /embed` with file paths and `collection_name` → `FileLoader` (PDF/DOCX/TXT) → `sentence_splitter` (chunk 512, overlap 128) → `BAAI/bge-m3` embeddings (1024-dim) → Milvus collection + BM25 index persisted at `data/bm25_indices/{collection}.pkl`. Embedding runs in a `ThreadPoolExecutor` (`max_workers=4`).
-
-### Auth & encryption
-
-- Login issues an access token + a Keystore entry containing the public key, signed refresh token, and a `keyId`.
-- Each user has a `UserKeyPair` (RSA) whose private key is encrypted with `MASTER_ENCRYPTION_KEY` before storage. `POST /api/auth/encrypt` / `decrypt` use these keys; `rotate-keys` issues a new pair while preserving history (`status: 'active' | 'revoked' | 'decrypt-only'`).
-- Middleware lives in `node-server/src/middlewares/authentication.ts` and `errorHandler.ts`. Custom error classes (`BaseError`, `NotFoundError`, `BadRequestError`, …) in `src/core/` produce a uniform JSON error shape.
-
-### Frontend routing
-
-App Router with two route groups:
-- `(auth)/` — public: `/login`, `/register`, `/forgot-password`. Plain layout, no sidebar.
-- `(root)/` — protected: `/`, `/create`, `/workspace/[slug]`. Sidebar layout via `components/layouts/`.
-
-Auth state lives in `context/AuthContext.tsx` and is persisted in `localStorage` (`accessToken`, `refreshToken`, `user`). React Query (`components/providers/ProtectedProvider`) handles server state and cache invalidation on upload.
-
-## Known gotchas
-
-- **Two file-upload code paths**: `apis/files.ts` calls `/api/files/embed` (multipart via Axios) while the workspace page uses a direct `fetch` to `/api/files/upload/{workspaceSlug}`. Pick one before adding upload features. (See `docs/project-roadmap.md`.)
-- **Duplicate `useAuth` hook**: defined in both `context/AuthContext.tsx` and `hooks/useAuth.ts`. The hooks/ version wraps mutations; the context version is the raw consumer. Don't import both in the same file.
-- **Hardcoded LLM endpoint** in `python-server` (`35.221.160.224:8000`). Treat as a TODO; do not bake new hardcoded URLs.
-- **Redis (IORedis) and Firebase Admin** are wired into `node-server` config but unused. Don't import them until a use case is decided.
-- **Rate-limit middleware** is in `package.json` but not applied to routes — auth endpoints are currently unprotected against brute force.
-- **`HUGGING_FACE_HUB_TOKEN`** is declared in `env.example` but HF model downloads run unauthenticated. Required only for gated models.
-- **Build cache invalidation for BM25**: re-embedding a collection does not version the BM25 pickle. Delete the file under `data/bm25_indices/` if you change the chunking strategy.
+- Commit, print or copy credentials. The repo has leaked them before, and git history still holds them. `node-server/config.json` may still exist locally (it is gitignored); never read it into output or copy it into an image.
+- Log passwords, password hashes, tokens, key material, DB URIs or full emails.
+- Create `.md` files outside `docs/` or `plans/` unless asked.
 
 ## Conventions
 
-- **TypeScript strict** is on in both `client/` and `node-server/`. Avoid `any`.
-- **File naming**: kebab-case in JS/TS/shell; snake_case in Python; PascalCase for React component files (`ChatBubble.tsx`).
-- **Path aliases**: `node-server` uses `@/` aliases resolved by `tsc-alias` at build time. `client` uses Next.js's default `@/` alias.
-- **Response shape (node-server)**: always wrap in `SuccessResponse` (`{ status, message, data }`); throw a `BaseError` subclass for failures — the global `errorHandler` formats them.
-- **Logging**: Winston with `winston-daily-rotate-file` in `node-server` (`logs/app-YYYY-MM-DD.log`); stdlib `logging` in Python. Never log passwords, tokens, or full emails.
-- **Commits**: Conventional Commits (`feat:`, `fix:`, `docs:`, `refactor:`, …). Do not add AI-tool references in messages.
-- **Markdown**: per `.claude/rules/`, only create new `.md` files under `docs/` or `plans/` unless the user explicitly asks otherwise.
-
-Deeper conventions per service: `docs/code-standards.md`. Design tokens / shadcn patterns: `docs/design-guidelines.md`. Deployment & troubleshooting: `docs/deployment-guide.md`.
+- TypeScript `strict` in both TS packages. Do not add `any`.
+- node-server layering: route → controller → service → repository → model. Return `SuccessResponse`; throw `BaseError` subclasses (`src/core/`).
+- File naming: kebab-case or `<name>.<layer>.ts` in TS, PascalCase for React components, snake_case for Python.
+- Conventional Commits (`feat:`, `fix:`, `refactor:`, `docs:` …). Do not mention AI tools.

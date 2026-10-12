@@ -31,8 +31,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Create necessary directories
-RUN mkdir -p /app/data /app/volumes /app/evaluation
+# Create necessary directories. /shared/uploads is the volume node-server downloads uploads into;
+# /embed receives paths inside it. Same mode as in node-server/dockerfile so either container can initialise it.
+RUN mkdir -p /app/data /app/volumes /app/evaluation /shared/uploads && chmod 1777 /shared/uploads
 
 # Create non-root user for security
 RUN adduser --disabled-password --gecos '' --shell /bin/bash appuser && \

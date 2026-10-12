@@ -15,7 +15,6 @@ import { getDataByField } from '@/utils'
 import { keyStoreService } from './keyStore,service'
 import userRepo from '@/repositories/user.repo'
 import keystoreRepo from '@/repositories/keystore.repo'
-import CommunicationKey from '@/utils/communicationKey'
 import { EncryptionService } from './encryption.service'
 import { AsymmetricCrypto } from '@/utils/encryption.util'
 import { Types } from 'mongoose'
@@ -158,19 +157,19 @@ export class authService {
   }
 
   logout = async (req: Request) => {
+    // The token payload is { user }, so the caller lives at req.user.user
+    const { user } = req.user
+
     // Sign logout event for audit trail
     const logoutData = {
-      userId: req.user._id.toString(),
+      userId: user._id,
       logoutTime: new Date().toISOString(),
       sessionId: req.keyStore._id.toString()
     }
 
-    console.log(1, logoutData)
-
     try {
       // Sign logout event (optional, for audit purposes)
-      await this.encryptionService.signData(JSON.stringify(logoutData), req.user._id)
-      console.log(2)
+      await this.encryptionService.signData(JSON.stringify(logoutData), user._id)
     } catch (error) {
       // Don't fail logout if signing fails
       console.warn('Failed to sign logout event:', error)
@@ -183,17 +182,20 @@ export class authService {
   }
 
   refreshToken = async (req: Request) => {
-    const { refreshToken } = req.body
-    const { user, keyStore } = req
+    // refreshAuthentication has already verified the refresh-token header
+    const { refreshToken, keyStore } = req
+    const { user } = req.user
 
-    if (!refreshToken) {
-      throw new BadRequestError('Refresh token is required')
+    // A refresh token is single-use; seeing one again means it leaked, so revoke the whole session
+    if (keyStore.refreshTokensUsed?.includes(refreshToken)) {
+      await keystoreRepo.remove(keyStore._id)
+      throw new UnauthorizedError('Unauthorized')
     }
 
     // Verify the stored signature is still valid
     try {
       const tokenPayload = {
-        userId: user._id.toString(),
+        userId: user._id,
         email: user.email,
         name: user.name,
         keyId: keyStore.keyId || 'legacy',
@@ -234,7 +236,7 @@ export class authService {
    * Rotate user's encryption keys (security operation)
    */
   rotateKeys = async (req: Request) => {
-    const { user } = req
+    const { user } = req.user
 
     try {
       // Generate new key pair
@@ -289,7 +291,7 @@ export class authService {
    */
   encryptData = async (req: Request) => {
     const { data, recipientUserId } = req.body
-    const { user } = req
+    const { user } = req.user
 
     if (!data || !recipientUserId) {
       throw new BadRequestError('Data and recipient user ID are required')
@@ -324,7 +326,7 @@ export class authService {
    */
   decryptData = async (req: Request) => {
     const { encryptedData } = req.body
-    const { user } = req
+    const { user } = req.user
 
     if (!encryptedData) {
       throw new BadRequestError('Encrypted data is required')

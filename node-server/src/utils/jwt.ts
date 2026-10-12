@@ -1,18 +1,24 @@
-import User from '@/models/user.model'
+import { Types } from 'mongoose'
 import jwt from 'jsonwebtoken'
 import { configs } from '@/configs'
 
-const createTokens = (user: User, privateKey: string, passphrase?: string) => {
+// Only these fields are embedded in tokens; JWT payloads are readable by anyone holding the token
+export type TokenUser = { _id: Types.ObjectId | string; email: string; name: string }
+
+const toTokenUser = ({ _id, email, name }: TokenUser) => ({ _id: _id.toString(), email, name })
+
+const createTokens = (user: TokenUser, privateKey: string, passphrase?: string) => {
   try {
     // If passphrase is provided, create key object with passphrase
     const keyObject = passphrase ? { key: privateKey, passphrase } : privateKey
+    const payload = { user: toTokenUser(user) }
 
-    const accessToken = jwt.sign({ user }, keyObject, {
+    const accessToken = jwt.sign(payload, keyObject, {
       algorithm: 'RS256',
       expiresIn: configs.tokenInfo.accessTokenValidity
     })
 
-    const refreshToken = jwt.sign({ user }, keyObject, {
+    const refreshToken = jwt.sign(payload, keyObject, {
       algorithm: 'RS256',
       expiresIn: configs.tokenInfo.refreshTokenValidity
     })
@@ -27,7 +33,7 @@ const createTokens = (user: User, privateKey: string, passphrase?: string) => {
 }
 
 const verifyToken = (token: string, publicKey: string) => {
-  return jwt.verify(token, publicKey)
+  return jwt.verify(token, publicKey, { algorithms: ['RS256'] })
 }
 
 export { verifyToken, createTokens }
